@@ -175,6 +175,64 @@ impl Backend {
         self.config().forward_auth
     }
 
+    /// Provider family this backend belongs to, for caller-facing messages.
+    pub(crate) fn provider(&self) -> &'static str {
+        match self {
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => "OpenAI",
+            Backend::Anthropic(_) => "Anthropic",
+        }
+    }
+
+    /// Whether this backend may serve a request from this caller.
+    ///
+    /// A backend holding its own key always may. A forwarding backend may only
+    /// when the caller sent a credential this provider accepts, so a request
+    /// with no login is routed elsewhere instead of reaching the upstream
+    /// unauthenticated. When the caller's wire format is known it must be in
+    /// this provider's family, because `authorization` alone does not say which
+    /// provider issued the token and a forwarded login must not cross providers.
+    ///
+    /// Kept beside [`apply_forwarded_auth`](Self::apply_forwarded_auth) so what
+    /// is gated and what is actually forwarded cannot drift apart.
+    pub(crate) fn accepts_caller(&self, metadata: Option<&Metadata>) -> bool {
+        if !self.is_forwarding_auth() {
+            return true;
+        }
+        let Some(metadata) = metadata else {
+            return false;
+        };
+        if let Some(caller_format) = metadata.caller_wire_format
+            && !self.accepts_caller_format(caller_format)
+        {
+            return false;
+        }
+        let Some(headers) = metadata.http_headers.as_ref() else {
+            return false;
+        };
+        // Companion headers such as `chatgpt-account-id` identify an account,
+        // not a credential, so they cannot make a target eligible on their own.
+        let credentials: &[&str] = match self {
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => &["authorization"],
+            Backend::Anthropic(_) => &["authorization", "x-api-key"],
+        };
+        credentials.iter().any(|name| {
+            headers
+                .get(*name)
+                .is_some_and(|value| !value.as_bytes().trim_ascii().is_empty())
+        })
+    }
+
+    // Whether a caller using `caller_format` is in this backend's provider family.
+    fn accepts_caller_format(&self, caller_format: WireFormat) -> bool {
+        match self {
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => matches!(
+                caller_format,
+                WireFormat::OpenAiChat | WireFormat::OpenAiResponses
+            ),
+            Backend::Anthropic(_) => matches!(caller_format, WireFormat::AnthropicMessages),
+        }
+    }
+
     /// Applies only the caller credential accepted by this provider.
     pub(crate) fn apply_forwarded_auth(
         &self,
@@ -347,6 +405,92 @@ mod tests {
             extra_body: BTreeMap::new(),
             max_retries: 0,
         }
+    }
+
+    fn forwarding_config(base_url: &str) -> HttpBackendConfig {
+        HttpBackendConfig {
+            api_key: None,
+            forward_auth: true,
+            ..config(base_url)
+        }
+    }
+
+    fn caller(caller_wire_format: Option<WireFormat>, headers: &[(&str, &str)]) -> Metadata {
+        let mut http_headers = http::HeaderMap::new();
+        for (name, value) in headers {
+            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name");
+            let value = HeaderValue::from_str(value).expect("valid header value");
+            http_headers.insert(name, value);
+        }
+        Metadata {
+            http_headers: Some(http_headers),
+            caller_wire_format,
+            ..Metadata::default()
+        }
+    }
+
+    #[test]
+    fn a_keyed_backend_accepts_every_caller() {
+        let backend = Backend::Anthropic(config("https://api.anthropic.com"));
+        assert!(backend.accepts_caller(None));
+        assert!(backend.accepts_caller(Some(&caller(Some(WireFormat::OpenAiChat), &[]))));
+    }
+
+    #[test]
+    fn a_forwarding_backend_needs_its_own_provider_credential() {
+        let backend = Backend::Anthropic(forwarding_config("https://api.anthropic.com"));
+        let anthropic = Some(WireFormat::AnthropicMessages);
+
+        assert!(backend.accepts_caller(Some(&caller(
+            anthropic,
+            &[("authorization", "Bearer sk-ant-oat-token")]
+        ))));
+        assert!(backend.accepts_caller(Some(&caller(anthropic, &[("x-api-key", "sk-ant-key")]))));
+
+        // No credential at all, and a credential that is present but empty.
+        assert!(!backend.accepts_caller(Some(&caller(anthropic, &[]))));
+        assert!(!backend.accepts_caller(Some(&caller(anthropic, &[("authorization", " ")]))));
+        // No metadata means no headers to forward.
+        assert!(!backend.accepts_caller(None));
+    }
+
+    #[test]
+    fn a_forwarding_backend_rejects_the_other_providers_caller() {
+        let backend = Backend::Anthropic(forwarding_config("https://api.anthropic.com"));
+        // `authorization` alone does not say who issued the token, so an OpenAI
+        // caller's login must not reach an Anthropic upstream.
+        assert!(!backend.accepts_caller(Some(&caller(
+            Some(WireFormat::OpenAiChat),
+            &[("authorization", "Bearer codex-token")]
+        ))));
+
+        let openai = Backend::OpenAiResponses(forwarding_config("https://api.openai.com/v1"));
+        assert!(!openai.accepts_caller(Some(&caller(
+            Some(WireFormat::AnthropicMessages),
+            &[("authorization", "Bearer sk-ant-oat-token")]
+        ))));
+        assert!(openai.accepts_caller(Some(&caller(
+            Some(WireFormat::OpenAiChat),
+            &[("authorization", "Bearer codex-token")]
+        ))));
+    }
+
+    #[test]
+    fn openai_companion_headers_are_not_credentials() {
+        let backend = Backend::OpenAiChat(forwarding_config("https://api.openai.com/v1"));
+        assert!(!backend.accepts_caller(Some(&caller(
+            Some(WireFormat::OpenAiChat),
+            &[("chatgpt-account-id", "account-123"), ("x-openai-fedramp", "true")]
+        ))));
+    }
+
+    #[test]
+    fn an_unknown_caller_format_is_gated_on_the_credential_alone() {
+        // Embedded hosts do not serve an HTTP API, so they record no caller
+        // format; requiring one would make forwarding unusable for them.
+        let backend = Backend::Anthropic(forwarding_config("https://api.anthropic.com"));
+        assert!(backend.accepts_caller(Some(&caller(None, &[("x-api-key", "sk-ant-key")]))));
+        assert!(!backend.accepts_caller(Some(&caller(None, &[]))));
     }
 
     #[test]

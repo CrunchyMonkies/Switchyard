@@ -370,6 +370,11 @@ pub struct StageTierConfig {
     pub capable_target: String,
     /// The efficient tier.
     pub efficient_target: String,
+    /// Targets reachable only by falling through from a scored tier, ordered
+    /// most preferred first. They are never scored, so they do not add a tier;
+    /// they stand behind `capable_target` for the turns it cannot serve.
+    #[serde(default)]
+    pub reserve_targets: Vec<String>,
     /// How much agreement a decisive pick needs, from 0 to 1.
     pub confidence_threshold: f64,
     /// How many trailing tool results the signals are scored over.
@@ -384,6 +389,17 @@ pub struct StageTierConfig {
     /// System prompt handed to the efficient tier.
     #[serde(default)]
     pub efficient_system_prompt: Option<String>,
+}
+
+impl StageTierConfig {
+    /// Completion destinations in fall-through order: the capable tier, its
+    /// reserves, then the efficient tier.
+    fn target_names(&self) -> Vec<&str> {
+        let mut names = vec![self.capable_target.as_str()];
+        names.extend(self.reserve_targets.iter().map(String::as_str));
+        names.push(self.efficient_target.as_str());
+        names
+    }
 }
 
 impl StageClassifierConfig {
@@ -445,10 +461,7 @@ impl AlgorithmSpec {
             Self::StageRouter {
                 tiers, subagents, ..
             } => {
-                let mut names = vec![
-                    tiers.capable_target.as_str(),
-                    tiers.efficient_target.as_str(),
-                ];
+                let mut names = tiers.target_names();
                 if let Some(subagents) = subagents {
                     names.extend(subagents.routing_target_names());
                 }
@@ -457,10 +470,7 @@ impl AlgorithmSpec {
             Self::Composite {
                 stage, subagents, ..
             } => {
-                let mut names = vec![
-                    stage.capable_target.as_str(),
-                    stage.efficient_target.as_str(),
-                ];
+                let mut names = stage.target_names();
                 if let Some(subagents) = subagents {
                     names.extend(subagents.routing_target_names());
                 }
@@ -942,6 +952,7 @@ fn build_algorithm(
             let StageTierConfig {
                 capable_target,
                 efficient_target,
+                reserve_targets,
                 confidence_threshold,
                 recent_turn_window,
                 handoff_notes,
@@ -956,6 +967,8 @@ fn build_algorithm(
             let capable = resolve_target_model_id(route_name, capable_target, targets)?;
             let efficient = resolve_target_model_id(route_name, efficient_target, targets)?;
             let mut config = StageRouterConfig::new(*picker, *confidence_threshold);
+            config.reserve_targets =
+                resolve_target_model_ids(route_name, reserve_targets, targets)?;
             config.recent_window = *recent_turn_window;
             config.handoff_notes = handoff_notes.clone();
             config.tier_prompts = tier_prompts(
@@ -996,6 +1009,8 @@ fn build_algorithm(
             let judge_target = resolve_target_model_id(route_name, &classifier.target, targets)?;
             let mut stage_config =
                 StageRouterConfig::new(PickerMode::EfficientFirst, stage.confidence_threshold);
+            stage_config.reserve_targets =
+                resolve_target_model_ids(route_name, &stage.reserve_targets, targets)?;
             stage_config.recent_window = stage.recent_turn_window;
             stage_config.handoff_notes = stage.handoff_notes.clone();
             stage_config.tier_prompts = tier_prompts(
@@ -1125,6 +1140,17 @@ fn resolve_targets<'a>(
 ) -> AlgorithmResult<Vec<ModelId>> {
     names
         .into_iter()
+        .map(|name| resolve_target_model_id(route_name, name, targets))
+        .collect()
+}
+
+fn resolve_target_model_ids(
+    route_name: &str,
+    names: &[String],
+    targets: &BTreeMap<String, ModelId>,
+) -> AlgorithmResult<Vec<ModelId>> {
+    names
+        .iter()
         .map(|name| resolve_target_model_id(route_name, name, targets))
         .collect()
 }

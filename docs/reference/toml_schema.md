@@ -70,10 +70,19 @@ values.
 This setting gives `base_url` the caller's login. Enable it only when that
 upstream should receive the credential, and use HTTPS unless the upstream runs
 on loopback. Forwarding clients do not follow HTTP redirects. Check every
-forwarding client used by a route, including classifier and judge targets. The
-server rejects an Anthropic forwarding route called through an OpenAI endpoint,
-or an OpenAI forwarding route called through an Anthropic endpoint, before it
-calls an upstream.
+forwarding client used by a route, including classifier and judge targets.
+
+A forwarding target only serves a request that carries a credential it may
+receive: the caller must have arrived through that provider's API *and* sent
+that provider's credential header. A caller who sends neither, or who sends the
+other provider's login, does not reach that upstream — the target is dropped
+from the route's candidates for that request and the next target serves it. A
+route whose targets *all* forward is rejected up front with `400` when it is
+called through the other provider's API; when every candidate is dropped, the
+request fails with `401` and `missing_caller_credential` without any upstream
+call. This makes a mixed route — a forwarding target alongside keyed ones —
+serve callers who have a login through it, and everyone else through the keyed
+targets.
 
 ## `[targets.<name>]`
 
@@ -201,6 +210,7 @@ optional `handoff_notes` and `classifier` tables and for tuning.
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `capable_target` | Yes | — | Capable tier. |
+| `reserve_targets` | No | `[]` | Extra targets tried, in order, between the capable and efficient tiers when a tier is unavailable. Never scored by the signals or the judge. |
 | `efficient_target` | Yes | — | Efficient tier. |
 | `picker` | Yes | — | `efficient_first`, or `capable_first` (experimental, unbenchmarked). Tier used when the signals are not confident. |
 | `confidence_threshold` | Yes | — | Corroboration a decisive pick needs. In `[0, 1]`. |
@@ -224,6 +234,7 @@ configuration. Today a classifier sets the tier a stage router falls open to whe
 | `classifier.classify_trigger` | Yes | — | `user_turn` re-picks the tier whenever the user speaks, `new_session` picks once and holds it. `every_request` is rejected here: a judge call per tool step is the cost this route exists to avoid. |
 | `classifier.message_hash_fallback` | No | `false` | Retains the tier by hashing the first user message, for clients that send no session ID. Unlike the `llm_classifier` route, this works on either trigger. Conversations opening with the same text share a tier. |
 | `stage.capable_target` | Yes | — | Capable tier. |
+| `stage.reserve_targets` | No | `[]` | Extra fall-through targets between the tiers. Never scored. |
 | `stage.efficient_target` | Yes | — | Efficient tier. |
 | `stage.confidence_threshold` | Yes | — | Corroboration a decisive signal needs. In `[0, 1]`. |
 | `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |

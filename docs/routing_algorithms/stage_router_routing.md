@@ -222,6 +222,26 @@ escalation_note = "the previous model was stalling; pick up the diagnosis"
 # only_on_wrong_signal_escalation = true  # default; set false to always send
 ```
 
+### Optional: reserve targets
+
+`reserve_targets` lists extra targets the route falls through to when a tier
+cannot serve a request — an upstream failure the router can retry past, or a
+`forward_auth` target the caller has no credential for. They sit between the
+tiers, so a turn that escalated to the capable tier reaches a reserve before
+dropping back to the efficient one:
+
+```toml
+[routes.stage]
+# ...
+capable_target = "strong"
+reserve_targets = ["mid"]     # tried after "strong", before "weak"
+efficient_target = "weak"
+```
+
+Reserves are never scored. The signals and the optional classifier still choose
+between exactly the two tiers; a reserve only ever serves a request the chosen
+tier could not.
+
 ### Optional: per-tier system prompts
 
 ```toml

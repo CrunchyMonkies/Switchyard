@@ -99,8 +99,10 @@ A client can set `forward_auth = true` instead of `api_key_env` to send each
 caller's credential to that upstream. OpenAI clients forward `authorization`,
 `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic clients forward
 `authorization` or `x-api-key`. Enable this only for an upstream that should
-receive the caller's login. The server rejects a forwarding route called
-through the other provider's API.
+receive the caller's login. A forwarding target is used only for callers who
+arrived through its provider's API carrying that provider's credential; other
+callers are served by the route's remaining targets, or get `401` if the route
+has none.
 
 ### Run the server
 
