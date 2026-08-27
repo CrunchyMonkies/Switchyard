@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Caller-credential gating for `forward_auth`** — a forwarding target now
+  serves only callers who arrived through its provider's API carrying that
+  provider's credential. Other callers fall through to the route's remaining
+  targets, so one route can offer a subscription-login upstream to clients that
+  have a login and keyed upstreams to everyone else. With every candidate
+  gated, the request fails with `401` / `missing_caller_credential` and no
+  upstream call.
+- **Stage-router reserve targets** — `reserve_targets` adds fall-through-only
+  targets between the capable and efficient tiers. They are never scored by the
+  signals or the judge, and only serve a request the chosen tier could not.
+  Available on `stage_router` routes and under `stage` in a `composite` route.
 - **Advisor-gate routing** — new `advisor` route type pairing the serving
   executor with a stronger judge-only advisor that reviews terminal turns:
   APPROVE releases the buffered turn, REDO discards it and feeds the advisor's
@@ -62,6 +73,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Tokenless calls to a forwarding route fail with a Switchyard `401`** — a
+  route whose targets all use `forward_auth`, called without the provider's
+  credential, now returns `401` / `missing_caller_credential` from Switchyard
+  instead of relaying the provider's own unauthenticated response.
+- **A mixed route no longer rejects the other provider's callers** — the
+  caller-format check that made any route containing a forwarding target
+  callable through that provider's API only now applies to routes where *every*
+  target forwards. On a mixed route, the check moves to a per-candidate filter.
 - **`Algorithm::route` returns `Result<RoutingOutcome>`** — instead of the
   bare final `Result`, so callers observe the full routing outcome (see #458
   for the design). (#459)

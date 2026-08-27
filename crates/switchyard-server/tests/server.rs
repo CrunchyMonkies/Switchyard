@@ -1819,6 +1819,194 @@ target = "claude"
     Ok(())
 }
 
+/// One route can hold a forwarding target and server-keyed targets at once. A
+/// caller with the matching login reaches the forwarding target; every other
+/// caller — wrong provider, or no credential at all — falls through to the next
+/// configured target instead of being rejected or sent upstream unauthenticated.
+#[tokio::test]
+async fn mixed_route_falls_back_when_the_caller_has_no_forwardable_login() -> TestResult {
+    let anthropic = MockUpstream::start().await?;
+    let local = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.claude]
+format = "anthropic_messages"
+base_url = "{anthropic_url}"
+forward_auth = true
+max_retries = 0
+
+[llm_clients.local]
+format = "openai_chat"
+base_url = "{local_url}"
+max_retries = 0
+
+[targets.claude]
+id = "claude-opus"
+llm_client = "claude"
+
+[targets.reserve]
+id = "local/large"
+llm_client = "local"
+
+[targets.small]
+id = "local/small"
+llm_client = "local"
+
+[routes.auto]
+id = "switchyard/auto"
+type = "stage_router"
+capable_target = "claude"
+reserve_targets = ["reserve"]
+efficient_target = "small"
+picker = "capable_first"
+confidence_threshold = 0.5
+"#,
+        anthropic_url = anthropic.base_url,
+        local_url = local.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+
+    // An OpenAI caller with no credential at all: the route still serves, from
+    // the reserve behind the gated capable tier.
+    let openai_anonymous = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(openai_anonymous.status, StatusCode::OK);
+
+    // An OpenAI caller's own login must not reach an Anthropic upstream, so this
+    // request falls back exactly as the anonymous one did.
+    let openai_login = send_with_headers(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": "switchyard/auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+        &[("authorization", "Bearer codex-login-token")],
+    )
+    .await?;
+    assert_eq!(openai_login.status, StatusCode::OK);
+
+    // An Anthropic caller without the login is served locally too — the route is
+    // reachable from either API now that not every target forwards.
+    let anthropic_anonymous = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "switchyard/auto",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(anthropic_anonymous.status, StatusCode::OK);
+
+    // Nothing so far may have touched the forwarding upstream, and every turn
+    // fell through to the reserve rather than all the way to the efficient tier.
+    assert_eq!(anthropic.calls.lock().await.len(), 0);
+    assert_eq!(
+        local.models().await,
+        vec!["local/large", "local/large", "local/large"]
+    );
+
+    // With the login present the capable tier serves, and the reserve is untouched.
+    let anthropic_login = send_with_headers(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "switchyard/auto",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+        &[
+            ("authorization", "Bearer claude-oauth-token"),
+            ("anthropic-beta", "oauth-2025-04-20,unsupported-beta"),
+        ],
+    )
+    .await?;
+    assert_eq!(anthropic_login.status, StatusCode::OK);
+    assert_eq!(anthropic.models().await, vec!["claude-opus"]);
+    assert_eq!(local.calls.lock().await.len(), 3);
+
+    Ok(())
+}
+
+/// When every target forwards and the caller sent no credential, there is nothing
+/// left to fall back to. The request fails before any upstream call, with a status
+/// that names what the caller must supply.
+#[tokio::test]
+async fn forwarding_route_without_a_caller_login_fails_before_calling_upstream() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.claude]
+format = "anthropic_messages"
+base_url = "{base_url}"
+forward_auth = true
+max_retries = 0
+
+[targets.claude]
+id = "claude-opus"
+llm_client = "claude"
+
+[routes.claude]
+id = "switchyard/claude"
+type = "passthrough"
+target = "claude"
+"#,
+        base_url = upstream.base_url
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "switchyard/claude",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(upstream.calls.lock().await.len(), 0);
+
+    // An empty credential is no credential.
+    let empty_login = send_with_headers(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(json!({
+            "model": "switchyard/claude",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hello"}]
+        })),
+        &[("authorization", "")],
+    )
+    .await?;
+    assert_eq!(empty_login.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(upstream.calls.lock().await.len(), 0);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn responses_client_forwards_openai_login_when_configured() -> TestResult {
     let upstream = MockUpstream::start().await?;

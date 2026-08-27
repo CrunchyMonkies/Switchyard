@@ -236,7 +236,11 @@ fn build_multi_format_client(
   backend's configured key. OpenAI backends forward `authorization`,
   `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic backends forward
   `authorization` or `x-api-key`; they also keep `oauth-*` values from
-  `anthropic-beta` and remove other caller-supplied beta values.
+  `anthropic-beta` and remove other caller-supplied beta values. A forwarding
+  backend reports `CallerEligibility::MissingCallerCredential` for a request
+  whose `metadata.caller_wire_format` belongs to another provider, or that
+  carries no non-empty credential header, so the router skips it instead of
+  sending an unauthenticated call upstream.
 - Per-backend custom headers go in `HttpBackendConfig::extra_headers`. Set credentials with
   `api_key`. OpenAI backends reject `Authorization`; Anthropic backends reject `x-api-key`
   and `anthropic-version`. Header names are case-insensitive.

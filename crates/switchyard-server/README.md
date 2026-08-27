@@ -79,8 +79,12 @@ A client can set `forward_auth = true` instead of `api_key_env` to send the
 caller's credential to the configured upstream. OpenAI clients forward
 `authorization`, `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic clients
 forward `authorization` or `x-api-key`. Enable this only when every forwarding
-client's `base_url` should receive the caller's login. A forwarding route must
-be called through the matching provider API.
+client's `base_url` should receive the caller's login. A forwarding target
+serves only callers who arrived through its provider's API carrying that
+provider's credential; other callers fall through to the route's remaining
+targets, or get `401` when the route has none. A route whose targets all
+forward is still rejected up front when called through the other provider's
+API.
 Target-level `extra_body` values are shallow-merged into the upstream request when
 the request does not already contain that key.
 `max_retries` defaults to `2` and applies to transport failures, timeouts, HTTP 408/429, and 5xx

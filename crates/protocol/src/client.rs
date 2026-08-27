@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::{ModelId, Request, Response};
+use crate::{Metadata, ModelId, Request, Response};
 
 /// A boxed client-specific error preserved as the source of a routed call failure.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -101,6 +101,14 @@ pub enum LlmClientError {
         source: BoxError,
     },
 
+    /// Every target able to serve the request needs a credential the caller did
+    /// not supply, so nothing was called upstream.
+    #[error("no target can serve this request: {provider} credential missing from the caller")]
+    MissingCallerCredential {
+        /// Provider family whose credential the remaining targets required.
+        provider: &'static str,
+    },
+
     /// A string message. Useful in testing, but prefer adding variants over using this.
     #[error("{0}")]
     General(String),
@@ -125,6 +133,22 @@ impl RoutingFallbackReason {
     }
 }
 
+/// Whether a client can serve a particular caller's request.
+///
+/// Returned by [`RoutedLlmClient::caller_eligibility`] so routing can skip a
+/// target and still say what the caller would need to reach it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallerEligibility {
+    /// The client can serve this request.
+    Eligible,
+    /// The client serves only callers that supply this provider's credential,
+    /// and this request did not.
+    MissingCallerCredential {
+        /// Provider family whose credential the caller must supply.
+        provider: &'static str,
+    },
+}
+
 /// Performs the actual model call for a target. This is the one piece of I/O the
 /// library does not own — a host implements it over its own transport (HTTP SDK,
 /// in-process model, mock). It serves a call the stream consumer chose not to
@@ -139,4 +163,20 @@ impl RoutingFallbackReason {
 pub trait RoutedLlmClient: Send + Sync {
     /// Make a request
     async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
+
+    /// Whether this client can serve `model` for a request carrying `metadata`.
+    ///
+    /// Routing consults this before spending a call on a target, so a target that
+    /// needs something the caller did not supply — such as a forwarded provider
+    /// credential — is skipped in favour of the next eligible one rather than
+    /// failing the request upstream. Implementations must not perform I/O.
+    /// Defaults to [`CallerEligibility::Eligible`], preserving the behaviour of
+    /// clients that serve every request they are configured for.
+    fn caller_eligibility(
+        &self,
+        _model: &ModelId,
+        _metadata: Option<&Metadata>,
+    ) -> CallerEligibility {
+        CallerEligibility::Eligible
+    }
 }

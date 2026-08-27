@@ -738,10 +738,13 @@ fn llm_json_body(
 #[allow(clippy::type_complexity, clippy::result_large_err)]
 fn resolve_route(
     state: &ServerState,
-    metadata: Metadata,
+    mut metadata: Metadata,
     body: Value,
     wire_format: WireFormat,
 ) -> std::result::Result<(&Route, Request), Response> {
+    // Record which API the caller used, so a forwarding target can tell whether
+    // the credential on this request was issued by its own provider.
+    metadata.caller_wire_format = Some(wire_format);
     let llm_request = decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
@@ -1000,6 +1003,15 @@ fn client_error(error: &LlmClientError) -> Response {
             source.to_string(),
             "upstream_error",
             "upstream_timeout",
+        ),
+        LlmClientError::MissingCallerCredential { provider } => error_response(
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "every target for this route forwards an {provider} login; \
+                 send the credential on the request to use it"
+            ),
+            "authentication_error",
+            "missing_caller_credential",
         ),
         LlmClientError::RequestEncoding(message) => server_error(message),
         _ => server_error(error.to_string()),

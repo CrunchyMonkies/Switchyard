@@ -15,8 +15,8 @@ use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, ModelId, Request,
-    Response, RoutedLlmClient,
+    CallerEligibility, LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata,
+    ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
     WireFormat, decode_aggregated_response, decode_request, decode_stream,
@@ -556,6 +556,32 @@ impl TranslatingLlmClient {
 impl RoutedLlmClient for TranslatingLlmClient {
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
+    }
+
+    fn caller_eligibility(
+        &self,
+        model: &ModelId,
+        metadata: Option<&Metadata>,
+    ) -> CallerEligibility {
+        // Resolve the same backend `call_rewrite_model` would use, so the
+        // gate answers for the backend that would actually be called. An
+        // unknown model stays eligible; `call` reports that misconfiguration.
+        let Some(config) = self.model_to_config.get(model) else {
+            return CallerEligibility::Eligible;
+        };
+        let wire_format = metadata
+            .and_then(|metadata| metadata.wire_format)
+            .unwrap_or_else(|| config.default_backend.wire_format());
+        let Some(backend) = self.backend_for(model, wire_format) else {
+            return CallerEligibility::Eligible;
+        };
+        if backend.accepts_caller(metadata) {
+            CallerEligibility::Eligible
+        } else {
+            CallerEligibility::MissingCallerCredential {
+                provider: backend.provider(),
+            }
+        }
     }
 }
 

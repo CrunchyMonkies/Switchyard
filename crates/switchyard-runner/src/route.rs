@@ -218,8 +218,20 @@ impl Route {
 }
 
 async fn serve_decision_dependency(clients: ClientRouter, call: CallModel) -> libsy::Result<()> {
+    // Mirror the serving path's gate so a decision predicts the target that would
+    // actually answer, rather than one the caller has no credential to reach.
+    let (models, gated) = clients.eligible_candidates(&call.request, &call.models);
+    if models.is_empty() {
+        return call.respond(Err(match gated {
+            Some((model, provider)) => LibsyError::client_call(
+                model,
+                LlmClientError::MissingCallerCredential { provider },
+            ),
+            None => LibsyError::NoTargets,
+        }));
+    }
     let mut result = Err(LibsyError::NoTargets);
-    for (index, model) in call.models.iter().enumerate() {
+    for (index, model) in models.iter().enumerate() {
         // The driver stamps only the first candidate, so every fallback must replace it.
         let mut request = call.request.clone();
         request.llm_request.model = Some(model.to_string());
@@ -233,8 +245,8 @@ async fn serve_decision_dependency(clients: ClientRouter, call: CallModel) -> li
                 break;
             }
             Err(source) => {
-                let try_next = index + 1 < call.models.len() && eligible_routing_fallback(&source);
-                result = Err(LibsyError::client_call(model.clone(), source));
+                let try_next = index + 1 < models.len() && eligible_routing_fallback(&source);
+                result = Err(LibsyError::client_call((*model).clone(), source));
                 if !try_next {
                     break;
                 }

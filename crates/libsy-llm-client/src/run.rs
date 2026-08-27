@@ -21,7 +21,8 @@ use http::StatusCode;
 use parking_lot::Mutex;
 use switchyard_libsy::{Algorithm, CallModel, LibsyError, Result, drive};
 use switchyard_protocol::{
-    LlmClientError, ModelId, Request, Response, RoutedLlmClient, RoutingFallbackReason,
+    CallerEligibility, LlmClientError, ModelId, Request, Response, RoutedLlmClient,
+    RoutingFallbackReason,
 };
 
 use crate::observation::{LlmCallObservation, RunObservation, RunObserver};
@@ -151,6 +152,10 @@ async fn serve(
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
+///
+/// Candidates whose client cannot serve this caller are dropped before any call is
+/// made, so a target needing a credential the caller did not supply costs no
+/// upstream request and does not fail the run while another candidate remains.
 async fn call_first_available(
     clients: &ClientRouter,
     algorithm: &str,
@@ -158,6 +163,16 @@ async fn call_first_available(
     models: &[ModelId],
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
 ) -> Result<Response> {
+    let (models, gated_provider) = clients.eligible_candidates(request, models);
+    if models.is_empty() {
+        return Err(match gated_provider {
+            Some((target, provider)) => LibsyError::client_call(
+                target,
+                LlmClientError::MissingCallerCredential { provider },
+            ),
+            None => LibsyError::NoTargets,
+        });
+    }
     for (index, target) in models.iter().enumerate() {
         let request = request_for(request, target);
         match call_one(
@@ -344,6 +359,42 @@ impl ClientRouter {
         }
     }
 
+    /// Candidates from `models` whose client can serve this request's caller.
+    ///
+    /// Returns the survivors in their original order, plus the first target that was
+    /// skipped and the provider credential it wanted. Callers report that pair only
+    /// when nothing survives, so a caller with no login learns what to supply instead
+    /// of seeing a bare "no targets".
+    pub fn eligible_candidates<'a>(
+        &self,
+        request: &Request,
+        models: &'a [ModelId],
+    ) -> (Vec<&'a ModelId>, Option<(ModelId, &'static str)>) {
+        let mut eligible = Vec::with_capacity(models.len());
+        let mut gated: Option<(ModelId, &'static str)> = None;
+        for target in models {
+            // A target with no configured client stays a candidate; the call itself
+            // reports that misconfiguration rather than having it masked as a gate.
+            let eligibility = self
+                .route(target)
+                .map_or(CallerEligibility::Eligible, |client| {
+                    client.caller_eligibility(target, request.metadata.as_ref())
+                });
+            match eligibility {
+                CallerEligibility::Eligible => eligible.push(target),
+                CallerEligibility::MissingCallerCredential { provider } => {
+                    tracing::info!(
+                        candidate = %target,
+                        provider,
+                        "skipping candidate; caller supplied no credential to forward"
+                    );
+                    gated.get_or_insert_with(|| (target.clone(), provider));
+                }
+            }
+        }
+        (eligible, gated)
+    }
+
     /// The client that serves `model`.
     ///
     /// Errors with [`LlmClientError::Configuration`] when the router maps models and has no
@@ -381,8 +432,8 @@ mod tests {
     use http::StatusCode;
     use switchyard_libsy::{Driver, RoutingOutcome};
     use switchyard_protocol::{
-        LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, completion_text, text_request,
-        text_response,
+        LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, completion_text,
+        text_request, text_response,
     };
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -534,6 +585,95 @@ mod tests {
         )
         .await;
         (client, result)
+    }
+
+    /// A client that serves only the models it was told the caller can reach.
+    struct GatedClient {
+        calls: Mutex<Vec<ModelId>>,
+        gated: ModelId,
+    }
+
+    #[async_trait]
+    impl RoutedLlmClient for GatedClient {
+        async fn call(&self, request: Request) -> std::result::Result<Response, LlmClientError> {
+            let model = request.model_id().unwrap_or_default();
+            self.calls.lock().push(model.clone());
+            Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(Some(model.to_string()), model)),
+                metadata: None,
+            })
+        }
+
+        fn caller_eligibility(
+            &self,
+            model: &ModelId,
+            _metadata: Option<&Metadata>,
+        ) -> CallerEligibility {
+            if *model == self.gated {
+                CallerEligibility::MissingCallerCredential {
+                    provider: "Anthropic",
+                }
+            } else {
+                CallerEligibility::Eligible
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gated_candidate_is_skipped_without_being_called() -> Result<()> {
+        let client = Arc::new(GatedClient {
+            calls: Mutex::new(Vec::new()),
+            gated: "gated".into(),
+        });
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["gated".into(), "open".into()],
+        });
+
+        let (selected, _) = run(
+            algorithm,
+            ClientRouter::single(client.clone()),
+            request(),
+            None,
+        )
+        .await?;
+
+        // The algorithm's selection stands — routing chose it — but the gated
+        // target costs no upstream call and the next candidate answers.
+        assert_eq!(selected, ModelId::from("gated"));
+        assert_eq!(&*client.calls.lock(), &[ModelId::from("open")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_candidate_gated_reports_the_missing_credential() {
+        let client = Arc::new(GatedClient {
+            calls: Mutex::new(Vec::new()),
+            gated: "gated".into(),
+        });
+        let algorithm = Arc::new(CandidateAlgorithm {
+            models: vec!["gated".into()],
+        });
+
+        let error = run(
+            algorithm,
+            ClientRouter::single(client.clone()),
+            request(),
+            None,
+        )
+        .await
+        .map(|(model, _)| model)
+        .expect_err("a run with no eligible candidate must fail");
+
+        assert!(matches!(
+            error,
+            LibsyError::ClientCall {
+                source: LlmClientError::MissingCallerCredential {
+                    provider: "Anthropic"
+                },
+                ..
+            }
+        ));
+        assert!(client.calls.lock().is_empty());
     }
 
     #[tokio::test]

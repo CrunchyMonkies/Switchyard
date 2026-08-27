@@ -263,6 +263,10 @@ impl DeploymentConfig {
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
         let mut by_model = HashMap::new();
         let mut caller_auth = None;
+        // Only a route where *every* target forwards can be rejected up front on the
+        // caller's format. A mixed route serves both caller families, so per-candidate
+        // filtering decides which of its targets a given request may reach.
+        let mut all_targets_forward = true;
         for name in route.callable_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
@@ -284,10 +288,13 @@ impl DeploymentConfig {
                     )));
                 }
                 caller_auth = Some(target_auth);
+            } else {
+                all_targets_forward = false;
             }
             let client: Arc<dyn RoutedLlmClient> = client.clone();
             by_model.insert(target.id.clone(), client);
         }
+        let caller_auth = caller_auth.filter(|_| all_targets_forward);
         Ok((ClientRouter::new(by_model), caller_auth))
     }
 

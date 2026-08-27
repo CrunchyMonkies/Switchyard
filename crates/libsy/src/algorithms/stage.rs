@@ -118,6 +118,12 @@ pub struct StageRouterConfig {
     /// judge's own target, plus the same configuration the standalone capability
     /// route takes.
     pub llm_fallback: Option<LlmFallback>,
+    /// Targets reachable only by falling through from a scored tier, ordered
+    /// most preferred first. The classifier never scores them, so they do not
+    /// become a third tier; they stand behind `capable` for the turns where it
+    /// cannot serve, such as a forwarding target the caller has no credential
+    /// for. Empty by default.
+    pub reserve_targets: Vec<ModelId>,
 }
 
 impl StageRouterConfig {
@@ -131,6 +137,7 @@ impl StageRouterConfig {
             handoff_notes: None,
             tier_prompts: TargetPrompts::default(),
             llm_fallback: None,
+            reserve_targets: Vec::new(),
         }
     }
 }
@@ -201,7 +208,11 @@ pub(crate) fn build_stage_route(
     let signals = ToolSignalProcessor {
         recent_window: config.recent_window.unwrap_or(DEFAULT_RECENT_WINDOW),
     };
-    let target_set = vec![capable.clone(), efficient.clone()];
+    // Reserves sit between the tiers so a turn that escalated to `capable` falls
+    // through to them before dropping all the way back to `efficient`.
+    let mut target_set = vec![capable.clone()];
+    target_set.extend(config.reserve_targets);
+    target_set.push(efficient.clone());
     let mut router = FallThrough::<State>::new_with_state(target_set)
         .with_name(STAGE_ROUTER)
         .with_processor(Arc::new(signals))
@@ -341,6 +352,36 @@ mod tests {
             StageRouter::new(ModelId::from("strong"), ModelId::from("weak"), config),
             Err(LibsyError::AlgorithmError { .. })
         ));
+    }
+
+    /// Reserves are fall-through-only: they never become a scored tier, but they
+    /// stand between the capable target and the efficient one, so a turn the
+    /// capable target cannot serve lands on a reserve before dropping a tier.
+    #[tokio::test]
+    async fn reserves_fall_through_between_the_tiers() -> Result<()> {
+        let mut config = config();
+        config.reserve_targets = vec![ModelId::from("reserve")];
+        let router = Arc::new(StageRouter::new(
+            ModelId::from("strong"),
+            ModelId::from("weak"),
+            config,
+        )?);
+        // The signal-only cascade makes no routing-time calls, so the serve
+        // callback only has to exist.
+        let outcome = crate::drive(router, turn_request(false), |call| async move {
+            call.respond(Err(LibsyError::NoTargets))
+        })
+        .await?;
+
+        // `efficient_first` picks the efficient tier; the fallbacks behind it keep
+        // the target-set order, so the reserve stands directly behind the capable
+        // tier and a turn only reaches it when the capable tier cannot serve.
+        assert_eq!(outcome.selected_model_id, ModelId::from("weak"));
+        assert_eq!(
+            outcome.fallback_models,
+            vec![ModelId::from("strong"), ModelId::from("reserve")]
+        );
+        Ok(())
     }
 
     #[test]

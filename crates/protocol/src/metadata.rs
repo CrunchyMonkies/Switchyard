@@ -194,6 +194,12 @@ pub struct Metadata {
     pub http_headers: Option<http::HeaderMap>,
     /// The wire format the request/response was originally encoded in, if known.
     pub wire_format: Option<WireFormat>,
+    /// The wire format the caller used to reach Switchyard, if known.
+    ///
+    /// Distinct from [`Self::wire_format`], which pins the *outbound* backend
+    /// format. This one identifies the provider family of any credential the
+    /// caller sent, so a forwarded login cannot cross providers.
+    pub caller_wire_format: Option<WireFormat>,
 }
 
 impl Metadata {
