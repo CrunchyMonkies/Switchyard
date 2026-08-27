@@ -1,0 +1,103 @@
+name: Release image
+
+# Builds the switchyard-server container image from the repository Dockerfile and
+# publishes it to GHCR. Upstream publishes wheels and crates only, so this is the
+# fork's own release path for deployments that consume an image.
+
+on:
+  push:
+    # Fork releases are CalVer date stamps (202608.27.0); the pattern also
+    # covers an upstream-style vMAJOR.MINOR.PATCH tag.
+    tags:
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: "Extra tag for this build, e.g. caller-auth"
+        required: false
+        type: string
+
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build and push container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the image name, so a mixed-case owner
+          # still yields a valid GHCR reference.
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=short,prefix=sha-
+            type=raw,value=${{ inputs.tag_suffix }},enable=${{ inputs.tag_suffix != '' }}
+
+      # Build and load locally first so an image whose binary cannot start is
+      # never published. The push step below is a cache hit on every layer.
+      #
+      # Only linux/amd64 is built: .cargo/config.toml compiles for x86-64-v3, and
+      # a cross-architecture Rust release build under QEMU costs hours.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: switchyard:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          cat > routes.toml <<'TOML'
+          schema_version = 1
+
+          [llm_clients.local]
+          format = "openai_chat"
+          base_url = "http://127.0.0.1:8000/v1"
+
+          [targets.only]
+          id = "test-model"
+          llm_client = "local"
+
+          [routes.only]
+          id = "smoke"
+          type = "passthrough"
+          target = "only"
+          TOML
+          # --dry-run parses the TOML, resolves every client and target reference
+          # and constructs the algorithms without binding a socket.
+          docker run --rm -v "$PWD/routes.toml:/routes.toml:ro" \
+            switchyard:smoke --config /routes.toml --dry-run
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

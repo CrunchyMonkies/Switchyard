@@ -39,9 +39,13 @@ jobs:
   #
   # This deliberately keeps release publishing on the public GitHub/PyPI path. Manual
   # branch builds only produce artifacts; tag builds publish through PyPI Trusted Publishing.
+  #
+  # Publishing belongs to the upstream repository. Guarding the two jobs that have no
+  # `needs` neutralises the whole workflow in a fork: a skipped dependency skips its
+  # dependents, and every other job chains off one of these two.
   validate-release-ref:
     name: Validate release ref
-    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.repository == 'NVIDIA-NeMo/Switchyard' && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -311,7 +315,7 @@ jobs:
 
   dev-artifact-wheel:
     name: Dev wheel artifact (linux-x86_64)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_dev_artifact }}
+    if: ${{ github.repository == 'NVIDIA-NeMo/Switchyard' && github.event_name == 'workflow_dispatch' && inputs.build_dev_artifact }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
