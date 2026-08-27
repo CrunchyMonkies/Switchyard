@@ -223,10 +223,9 @@ async fn serve_decision_dependency(clients: ClientRouter, call: CallModel) -> li
     let (models, gated) = clients.eligible_candidates(&call.request, &call.models);
     if models.is_empty() {
         return call.respond(Err(match gated {
-            Some((model, provider)) => LibsyError::client_call(
-                model,
-                LlmClientError::MissingCallerCredential { provider },
-            ),
+            Some((model, provider)) => {
+                LibsyError::client_call(model, LlmClientError::MissingCallerCredential { provider })
+            }
             None => LibsyError::NoTargets,
         }));
     }

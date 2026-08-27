@@ -480,7 +480,10 @@ mod tests {
         let backend = Backend::OpenAiChat(forwarding_config("https://api.openai.com/v1"));
         assert!(!backend.accepts_caller(Some(&caller(
             Some(WireFormat::OpenAiChat),
-            &[("chatgpt-account-id", "account-123"), ("x-openai-fedramp", "true")]
+            &[
+                ("chatgpt-account-id", "account-123"),
+                ("x-openai-fedramp", "true")
+            ]
         ))));
     }
 
